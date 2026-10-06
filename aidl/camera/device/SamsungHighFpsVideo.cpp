@@ -49,6 +49,9 @@ struct SamsungTags {
     uint32_t cameraClient = 0;
     uint32_t recordingMaxFps = 0;
     uint32_t recordingMinFps = 0;
+    // recordingMinFps does not exist on every HAL (it is absent on the Exynos 990 one), so it is
+    // only used when the HAL provides it.
+    bool hasRecordingMinFps = false;
 };
 
 std::once_flag sInitFlag;
@@ -124,9 +127,9 @@ void SamsungHighFpsVideo::init(const sp<common::helper::SamsungCameraModule>& mo
                           &t.availableVideoConfigurations) &&
                   findTag(ops, tags, "samsung.android.control", "cameraClient", &t.cameraClient) &&
                   findTag(ops, tags, "samsung.android.control", "recordingMaxFps",
-                          &t.recordingMaxFps) &&
-                  findTag(ops, tags, "samsung.android.control", "recordingMinFps",
-                          &t.recordingMinFps);
+                          &t.recordingMaxFps);
+        t.hasRecordingMinFps = findTag(ops, tags, "samsung.android.control", "recordingMinFps",
+                                       &t.recordingMinFps);
         if (!t.valid) {
             ALOGW("%s: Samsung video vendor tags not found, high fps video disabled", __FUNCTION__);
             return;
@@ -272,7 +275,7 @@ bool SamsungHighFpsVideo::patchSessionParams(CameraMetadata* params) {
     if (!params->exists(sTags.recordingMaxFps)) {
         params->update(sTags.recordingMaxFps, &maxFps, 1);
     }
-    if (!params->exists(sTags.recordingMinFps)) {
+    if (sTags.hasRecordingMinFps && !params->exists(sTags.recordingMinFps)) {
         params->update(sTags.recordingMinFps, &minFps, 1);
     }
 
