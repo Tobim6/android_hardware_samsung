@@ -88,7 +88,18 @@ ndk::ScopedAStatus CameraDevice::getCameraCharacteristics(CameraMetadata* _aidl_
             // may reallocate it: patch a copy instead.
             SamsungHighFpsVideo::init(mModule);
             common::helper::CameraMetadata patched(clone_camera_metadata(metadata.release()));
-            SamsungHighFpsVideo::patchCharacteristics(&patched);
+#ifdef CAMERA_HIGH_FPS_VIDEO_EXCLUDE_MASK
+            // Cameras whose sensor pipeline cannot run the advertised high fps modes (the HAL
+            // aborts the whole provider process when it can't start streaming) keep their
+            // original fps ranges. Bit N of the mask is camera id N.
+            const bool highFpsExcluded = mCameraIdInt >= 0 && mCameraIdInt < 64 &&
+                    ((CAMERA_HIGH_FPS_VIDEO_EXCLUDE_MASK >> mCameraIdInt) & 1ULL) != 0;
+#else
+            const bool highFpsExcluded = false;
+#endif
+            if (!highFpsExcluded) {
+                SamsungHighFpsVideo::patchCharacteristics(&patched);
+            }
             const camera_metadata_t* patchedRaw = patched.getAndLock();
             convertToAidl(patchedRaw, _aidl_return);
             patched.unlock(patchedRaw);

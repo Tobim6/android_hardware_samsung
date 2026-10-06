@@ -17,6 +17,9 @@ cc_library_shared {
     }) + select(soong_config_variable("samsungCameraVars", "high_fps_video_client"), {
         any @ flag_val: ["-DCAMERA_HIGH_FPS_VIDEO_CLIENT=" + flag_val],
         default: [],
+    }) + select(soong_config_variable("samsungCameraVars", "high_fps_video_exclude_mask"), {
+        any @ flag_val: ["-DCAMERA_HIGH_FPS_VIDEO_EXCLUDE_MASK=" + flag_val + "ULL"],
+        default: [],
     }),
     srcs: [
         "CameraDevice.cpp",
