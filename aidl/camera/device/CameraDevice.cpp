@@ -99,6 +99,7 @@ ndk::ScopedAStatus CameraDevice::getCameraCharacteristics(CameraMetadata* _aidl_
 #endif
             if (!highFpsExcluded) {
                 SamsungHighFpsVideo::patchCharacteristics(&patched);
+                SamsungHighFpsVideo::addVideoSizes(&patched);
             }
             const camera_metadata_t* patchedRaw = patched.getAndLock();
             convertToAidl(patchedRaw, _aidl_return);

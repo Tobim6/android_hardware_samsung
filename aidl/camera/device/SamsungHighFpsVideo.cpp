@@ -12,6 +12,7 @@
 #include <system/graphics-base.h>
 
 #include <algorithm>
+#include <map>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -282,6 +283,76 @@ bool SamsungHighFpsVideo::patchSessionParams(CameraMetadata* params) {
     ALOGI("%s: high fps session [%d, %d], cameraClient %d", __FUNCTION__, minFps, maxFps,
           CAMERA_HIGH_FPS_VIDEO_CLIENT);
     return true;
+}
+
+void SamsungHighFpsVideo::addVideoSizes(CameraMetadata* chars) {
+    if (chars == nullptr || !sTags.valid) {
+        return;
+    }
+    const CameraMetadata& ro = *chars;
+    camera_metadata_ro_entry videoConfigs = ro.find(sTags.availableVideoConfigurations);
+    if (videoConfigs.count == 0 || videoConfigs.count % kVideoConfigStride != 0) {
+        return;
+    }
+
+    // Lowest frame duration per size, for sizes that are at least 3840 pixels wide.
+    std::map<std::pair<int32_t, int32_t>, int64_t> wanted;
+    for (size_t i = 0; i < videoConfigs.count; i += kVideoConfigStride) {
+        const int32_t* c = &videoConfigs.data.i32[i];
+        if (c[0] < 3840 || c[3] <= 0 || c[3] > kMaxHighFps) {
+            continue;
+        }
+        int64_t duration = kNsPerSec / c[3];
+        auto key = std::make_pair(c[0], c[1]);
+        auto it = wanted.find(key);
+        if (it == wanted.end() || duration < it->second) {
+            wanted[key] = duration;
+        }
+    }
+    if (wanted.empty()) {
+        return;
+    }
+
+    camera_metadata_ro_entry cfg = ro.find(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS);
+    camera_metadata_ro_entry dur = ro.find(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS);
+    camera_metadata_ro_entry stall = ro.find(ANDROID_SCALER_AVAILABLE_STALL_DURATIONS);
+    if (cfg.count == 0 || cfg.count % 4 != 0 || dur.count == 0 || dur.count % 4 != 0 ||
+        stall.count == 0 || stall.count % 4 != 0) {
+        return;
+    }
+    // Entries are invalidated by update(): work on copies.
+    std::vector<int32_t> newCfg(cfg.data.i32, cfg.data.i32 + cfg.count);
+    std::vector<int64_t> newDur(dur.data.i64, dur.data.i64 + dur.count);
+    std::vector<int64_t> newStall(stall.data.i64, stall.data.i64 + stall.count);
+
+    const int32_t format = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
+    bool changed = false;
+    for (const auto& [size, duration] : wanted) {
+        bool present = false;
+        for (size_t i = 0; i < newCfg.size(); i += 4) {
+            if (newCfg[i] == format && newCfg[i + 1] == size.first && newCfg[i + 2] == size.second &&
+                newCfg[i + 3] == ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT) {
+                present = true;
+                break;
+            }
+        }
+        if (present) {
+            continue;
+        }
+        newCfg.insert(newCfg.end(), {format, size.first, size.second,
+                                     ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT});
+        newDur.insert(newDur.end(), {format, size.first, size.second, duration});
+        newStall.insert(newStall.end(), {format, size.first, size.second, 0});
+        changed = true;
+        ALOGI("%s: advertising video size %dx%d (min frame duration %lld ns)", __FUNCTION__,
+              size.first, size.second, (long long)duration);
+    }
+    if (!changed) {
+        return;
+    }
+    chars->update(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, newCfg.data(), newCfg.size());
+    chars->update(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, newDur.data(), newDur.size());
+    chars->update(ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, newStall.data(), newStall.size());
 }
 
 bool SamsungHighFpsVideo::isReconfigurationRequired(const camera_metadata_t* oldParams,

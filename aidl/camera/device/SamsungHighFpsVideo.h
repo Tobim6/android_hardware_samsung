@@ -45,6 +45,10 @@ class SamsungHighFpsVideo {
     // Returns false if nothing had to be changed.
     static bool patchSessionParams(common::helper::CameraMetadata* params);
 
+    // Adds the video sizes (>= 3840 wide) of the HAL video table that are missing from the public
+    // stream configuration list (e.g. front 4K, main 8K), with matching frame durations.
+    static void addVideoSizes(common::helper::CameraMetadata* chars);
+
     // Returns true if a change between two sets of session parameters needs a stream
     // reconfiguration: any change other than the AE target fps range, or a change of the
     // effective high fps range.
