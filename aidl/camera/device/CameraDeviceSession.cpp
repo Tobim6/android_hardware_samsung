@@ -7,6 +7,12 @@
 #define LOG_TAG "CamDevSession-impl"
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 
+#include <atomic>
+#include <time.h>
+#include <chrono>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include "CameraDeviceSession.h"
 
 #ifdef CAMERA_HIGH_FPS_VIDEO
@@ -860,6 +866,94 @@ void CameraDeviceSession::ResultBatcher::processCaptureResult(CaptureResult& res
     }
 }
 
+#ifdef CAMERA_HIGH_FPS_VIDEO
+namespace {
+// True from the moment the first request of a session is handed to the HAL until its first result arrives.
+// The HAL is in its "starting" state meanwhile and aborts if it is flushed.
+std::mutex sStartMutex;
+std::condition_variable sStartCv;
+bool sStartPending = false;
+
+void setStartPending(bool pending) {
+    {
+        std::lock_guard<std::mutex> lock(sStartMutex);
+        sStartPending = pending;
+    }
+    if (!pending) {
+        sStartCv.notify_all();
+    }
+}
+
+void waitForHalStart() {
+    std::unique_lock<std::mutex> lock(sStartMutex);
+    if (sStartPending) {
+        if (!sStartCv.wait_for(lock, std::chrono::milliseconds(2000), [] { return !sStartPending; })) {
+        }
+    }
+}
+}  // namespace
+#endif
+
+#ifdef CAMERA_HIGH_FPS_VIDEO
+namespace {
+// True while the open session is a constrained high speed (slow motion) session.
+std::atomic<bool> sConstrainedHighSpeedSession{false};
+// Id of the video-encoder stream of the current constrained high speed session, -1 if none.
+std::atomic<int> sVideoStreamId{-1};
+// True if the open camera is the ultrawide (it must keep the app's 120/240 fps range).
+std::atomic<bool> sSlowMoUltrawide{false};
+
+// Viewfinder-only frames of a high speed session, by frame number (index = frame % 64, value = frame + 1).
+std::atomic<uint32_t> sPaceMark[64];
+// steady clock time (ns) the last paced result was released.
+std::atomic<int64_t> sPaceLastNs{0};
+
+int64_t paceNowNs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+// Called for a result that carries buffers: if its request was viewfinder-only, release it no earlier than
+// 33 ms after the previously released viewfinder result.
+void paceViewfinderResult(uint32_t frameNumber) {
+    uint32_t want = frameNumber + 1;
+    uint32_t cur = sPaceMark[frameNumber % 64].load();
+    if (cur != want) {
+        return;
+    }
+    constexpr int64_t kStepNs = 33000000LL;
+    int64_t now = paceNowNs();
+    int64_t last = sPaceLastNs.load();
+    int64_t target = (last + kStepNs > now) ? last + kStepNs : now;
+    if (target - now > 120000000LL) {  // stale state: never sleep long
+        target = now;
+    }
+    sPaceLastNs = target;
+    if (target > now) {
+        struct timespec ts;
+        int64_t d = target - now;
+        ts.tv_sec = d / 1000000000LL;
+        ts.tv_nsec = d % 1000000000LL;
+        nanosleep(&ts, nullptr);
+    }
+}
+
+// True if |m| asks for an AE target fps range that tops out at 120 fps or more.
+bool wantsHighSpeedRange(const camera_metadata_t* m) {
+    if (m == nullptr) {
+        return false;
+    }
+    camera_metadata_ro_entry_t e;
+    if (find_camera_metadata_ro_entry(m, ANDROID_CONTROL_AE_TARGET_FPS_RANGE, &e) != 0 ||
+        e.count != 2) {
+        return false;
+    }
+    return e.data.i32[1] >= 120;
+}
+}  // namespace
+#endif
+
 ndk::ScopedAStatus CameraDeviceSession::configureStreams(
         const StreamConfiguration& in_requestedConfiguration,
         std::vector<HalStream>* _aidl_return) {
@@ -898,6 +992,26 @@ ndk::ScopedAStatus CameraDeviceSession::configureStreams(
     }
 
 #ifdef CAMERA_HIGH_FPS_VIDEO
+    {
+        // 8K only exists at 24 fps in the HAL.
+        bool has8k = false;
+        for (const auto& stream : in_requestedConfiguration.streams) {
+            if (stream.width >= 7680) {
+                has8k = true;
+            }
+        }
+        SamsungHighFpsVideo::setClampFps(has8k ? 24 : 0);
+        bool has4k = false;
+        for (const auto& stream : in_requestedConfiguration.streams) {
+            if (stream.width >= 3840 && stream.width < 7680) {
+                has4k = true;
+            }
+        }
+        SamsungHighFpsVideo::setZoomTranslate(has4k);
+    }
+#endif
+
+#ifdef CAMERA_HIGH_FPS_VIDEO
     // Translate a high fps AE target range into the Samsung session parameters the HAL needs
     // to leave its 30 fps sensor modes. Must stay alive until configure_streams returns.
     ::android::hardware::camera::common::helper::CameraMetadata highFpsParams;
@@ -906,9 +1020,24 @@ ndk::ScopedAStatus CameraDeviceSession::configureStreams(
         in_requestedConfiguration.operationMode ==
                 ::aidl::android::hardware::camera::device::StreamConfigurationMode::NORMAL_MODE) {
         highFpsParams = paramBuffer;  // clones
-        if (SamsungHighFpsVideo::patchSessionParams(&highFpsParams)) {
+        bool paramsChanged = SamsungHighFpsVideo::clampFpsRange(&highFpsParams);
+        paramsChanged |= SamsungHighFpsVideo::patchSessionParams(&highFpsParams);
+        if (paramsChanged) {
             paramBuffer = highFpsParams.getAndLock();
             highFpsParamsLocked = true;
+        }
+    }
+#endif
+
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    if (in_requestedConfiguration.operationMode ==
+            ::aidl::android::hardware::camera::device::StreamConfigurationMode::
+                    CONSTRAINED_HIGH_SPEED_MODE) {
+        camera_metadata_entry uwFocal = mDeviceInfo.find(ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+        if (uwFocal.count > 0 && uwFocal.data.f[0] > 2.0f && uwFocal.data.f[0] < 2.5f) {
+            ALOGE("%s: ultrawide slow motion is not supported (no sensor mode), refusing the session",
+                  __FUNCTION__);
+            return fromStatus(Status::ILLEGAL_ARGUMENT);
         }
     }
 #endif
@@ -923,8 +1052,52 @@ ndk::ScopedAStatus CameraDeviceSession::configureStreams(
         return fromStatus(Status::INTERNAL_ERROR);
     }
 
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    bool slowMoPreviewOnly = false;
+    sConstrainedHighSpeedSession = false;
+    sVideoStreamId = -1;
+    {
+        camera_metadata_entry focalE = mDeviceInfo.find(ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+        const bool uw = focalE.count > 0 && focalE.data.f[0] > 2.0f && focalE.data.f[0] < 2.5f;
+        sSlowMoUltrawide = uw;
+    }
+    if (in_requestedConfiguration.operationMode ==
+            ::aidl::android::hardware::camera::device::StreamConfigurationMode::
+                    CONSTRAINED_HIGH_SPEED_MODE) {
+        bool hasVideoStream = false;
+        for (const auto& st : in_requestedConfiguration.streams) {
+            if ((static_cast<uint64_t>(st.usage) & 0x10000ULL) != 0) {  // VIDEO_ENCODER
+                hasVideoStream = true;
+                sVideoStreamId = (int)st.id;
+            }
+        }
+        if (hasVideoStream) {
+            sConstrainedHighSpeedSession = true;
+        } else {
+            // Viewfinder-only slow motion session: the HAL cannot run its high speed mode without a video stream.
+            slowMoPreviewOnly = true;
+            stream_list.operation_mode = 0;  // CAMERA3_STREAM_CONFIGURATION_NORMAL_MODE
+        }
+    }
+    (void)slowMoPreviewOnly;
+    ::android::hardware::camera::common::helper::CameraMetadata slowMoSessionParams;
+    const camera_metadata_t* slowMoSessionLocked = nullptr;
+    if (!sConstrainedHighSpeedSession.load() && wantsHighSpeedRange(stream_list.session_parameters)) {
+        // Viewfinder of a slow motion mode: the HAL must not leave its normal sensor modes.
+        slowMoSessionParams = stream_list.session_parameters;  // clones
+        int32_t previewRange[2] = {30, 30};
+        slowMoSessionParams.update(ANDROID_CONTROL_AE_TARGET_FPS_RANGE, previewRange, 2);
+        slowMoSessionLocked = slowMoSessionParams.getAndLock();
+        stream_list.session_parameters = slowMoSessionLocked;
+    }
+#endif
     ATRACE_BEGIN("camera3->configure_streams");
     status_t ret = mDevice->ops->configure_streams(mDevice, &stream_list);
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    if (slowMoSessionLocked != nullptr) {
+        slowMoSessionParams.unlock(slowMoSessionLocked);
+    }
+#endif
     ATRACE_END();
 
 #ifdef CAMERA_HIGH_FPS_VIDEO
@@ -948,6 +1121,9 @@ ndk::ScopedAStatus CameraDeviceSession::configureStreams(
     } else {
         convertToAidl(stream_list, _aidl_return);
         mFirstRequest = true;
+#ifdef CAMERA_HIGH_FPS_VIDEO
+        setStartPending(false);
+#endif
     }
 
     return fromStatus(status);
@@ -1146,6 +1322,9 @@ ndk::ScopedAStatus CameraDeviceSession::flush() {
     Status status = initStatus();
     if (status == Status::OK) {
         // Flush is always supported on device 3.1 or later
+        #ifdef CAMERA_HIGH_FPS_VIDEO
+        waitForHalStart();
+#endif
         status_t ret = mDevice->ops->flush(mDevice);
         if (ret != OK) {
             status = Status::INTERNAL_ERROR;
@@ -1264,6 +1443,32 @@ Status CameraDeviceSession::processOneCaptureRequest(const CaptureRequest& reque
         return status;
     }
 
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    // 8K sessions: clamp AE fps ranges above the 24 fps the HAL supports at 8K.
+    ::android::hardware::camera::common::helper::CameraMetadata clampedSettings;
+    const camera_metadata_t* clampedBuf = nullptr;
+    if (halRequest.settings != nullptr && SamsungHighFpsVideo::needsFpsClamp(halRequest.settings)) {
+        clampedSettings = halRequest.settings;  // clones
+        if (SamsungHighFpsVideo::clampFpsRange(&clampedSettings)) {
+            clampedBuf = clampedSettings.getAndLock();
+            halRequest.settings = clampedBuf;
+        }
+    }
+#endif
+
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    // 4K high fps sessions: the HAL ignores the crop region, convert it into its zoom ratio.
+    ::android::hardware::camera::common::helper::CameraMetadata zoomSettings;
+    const camera_metadata_t* zoomBuf = nullptr;
+    if (halRequest.settings != nullptr && SamsungHighFpsVideo::needsZoomTranslate(halRequest.settings)) {
+        zoomSettings = halRequest.settings;  // clones
+        if (SamsungHighFpsVideo::translateZoom(&zoomSettings)) {
+            zoomBuf = zoomSettings.getAndLock();
+            halRequest.settings = zoomBuf;
+        }
+    }
+#endif
+
     std::vector<camera3_stream_buffer_t> outHalBufs;
     outHalBufs.resize(numOutputBufs);
     bool aeCancelTriggerNeeded = false;
@@ -1352,10 +1557,74 @@ Status CameraDeviceSession::processOneCaptureRequest(const CaptureRequest& reque
     halRequest.physcam_id = physicalCameraIds.data();
     halRequest.physcam_settings = physicalCameraSettings.data();
 
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    const camera_metadata_t* origSettings = halRequest.settings;
+    ::android::hardware::camera::common::helper::CameraMetadata slowMoClamp;
+    const camera_metadata_t* slowMoLocked = nullptr;
+    // The ultrawide must keep the app's 120/240 fps range: its HAL start fails in a 30 fps sensor mode.
+    bool slowMoClampNow = !sConstrainedHighSpeedSession.load() && !sSlowMoUltrawide.load();
+    if (!slowMoClampNow && sConstrainedHighSpeedSession.load() && !sSlowMoUltrawide.load() &&
+        sVideoStreamId.load() >= 0) {
+        // High speed session: clamp only the viewfinder requests, the ones without a video stream buffer.
+        slowMoClampNow = true;
+        for (size_t i = 0; i < request.outputBuffers.size(); i++) {
+            if ((int)request.outputBuffers[i].streamId == sVideoStreamId.load()) {
+                slowMoClampNow = false;
+            }
+        }
+    }
+    if (slowMoClampNow && wantsHighSpeedRange(origSettings)) {
+        slowMoClamp = origSettings;  // clones
+        int32_t previewRange[2] = {30, 30};
+        slowMoClamp.update(ANDROID_CONTROL_AE_TARGET_FPS_RANGE, previewRange, 2);
+        slowMoLocked = slowMoClamp.getAndLock();
+        halRequest.settings = slowMoLocked;
+    }
+#endif
     ATRACE_ASYNC_BEGIN("frame capture", request.frameNumber);
     ATRACE_BEGIN("camera3->process_capture_request");
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    if (mFirstRequest) {
+        setStartPending(true);
+    }
+#endif
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    {
+        // Mark viewfinder-only frames (high speed session, no video-encoder buffer) for result pacing.
+        bool vfOnly = sConstrainedHighSpeedSession.load() && sVideoStreamId.load() >= 0;
+        if (vfOnly) {
+            for (size_t pi = 0; pi < request.outputBuffers.size(); pi++) {
+                if (request.outputBuffers[pi].streamId == sVideoStreamId.load()) {
+                    vfOnly = false;
+                }
+            }
+        }
+        sPaceMark[request.frameNumber % 64] = vfOnly ? request.frameNumber + 1 : 0;
+    }
+#endif
     status_t ret = mDevice->ops->process_capture_request(mDevice, &halRequest);
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    if (slowMoLocked != nullptr) {
+        slowMoClamp.unlock(slowMoLocked);
+        halRequest.settings = origSettings;
+    }
+#endif
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    if (ret != OK) {
+        setStartPending(false);
+    }
+#endif
     ATRACE_END();
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    if (clampedBuf != nullptr) {
+        clampedSettings.unlock(clampedBuf);
+    }
+#endif
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    if (zoomBuf != nullptr) {
+        zoomSettings.unlock(zoomBuf);
+    }
+#endif
     if (aeCancelTriggerNeeded) {
         settingsOverride.unlock(halRequest.settings);
     }
@@ -1455,6 +1724,14 @@ uint64_t CameraDeviceSession::getCapResultBufferId(const buffer_handle_t& buf, i
 status_t CameraDeviceSession::constructCaptureResult(CaptureResult& result,
                                                      const camera3_capture_result* hal_result) {
     uint32_t frameNumber = hal_result->frame_number;
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    if (hal_result->num_output_buffers > 0 && sConstrainedHighSpeedSession.load()) {
+        paceViewfinderResult(frameNumber);
+    }
+#endif
+#ifdef CAMERA_HIGH_FPS_VIDEO
+    setStartPending(false);
+#endif
     bool hasInputBuf = (hal_result->input_buffer != nullptr);
     size_t numOutputBufs = hal_result->num_output_buffers;
     size_t numBufs = numOutputBufs + (hasInputBuf ? 1 : 0);

@@ -101,6 +101,7 @@ ndk::ScopedAStatus CameraDevice::getCameraCharacteristics(CameraMetadata* _aidl_
                 SamsungHighFpsVideo::patchCharacteristics(&patched);
                 SamsungHighFpsVideo::addVideoSizes(&patched);
             }
+            SamsungHighFpsVideo::addHighSpeedConfigs(&patched);
             const camera_metadata_t* patchedRaw = patched.getAndLock();
             convertToAidl(patchedRaw, _aidl_return);
             patched.unlock(patchedRaw);
@@ -355,6 +356,10 @@ ndk::ScopedAStatus CameraDevice::open(const std::shared_ptr<ICameraDeviceCallbac
 
 #ifdef CAMERA_HIGH_FPS_VIDEO
         SamsungHighFpsVideo::init(mModule);
+#endif
+
+#ifdef CAMERA_HIGH_FPS_VIDEO
+        SamsungHighFpsVideo::setNativeZoom(info.static_camera_characteristics);
 #endif
 
         session = createSession(device, info.static_camera_characteristics, in_callback);

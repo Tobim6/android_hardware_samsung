@@ -49,6 +49,25 @@ class SamsungHighFpsVideo {
     // stream configuration list (e.g. front 4K, main 8K), with matching frame durations.
     static void addVideoSizes(common::helper::CameraMetadata* chars);
 
+    // 8K video only runs at 24 fps: while an 8K session is configured, AE fps ranges with a higher
+    // maximum are clamped to [fps, fps]. setClampFps(0) switches the clamp off.
+    static void setClampFps(int32_t fps);
+    static bool needsFpsClamp(const camera_metadata_t* params);
+    static bool clampFpsRange(common::helper::CameraMetadata* params);
+
+    // 4K high fps sessions: the HAL ignores the crop region there, so it is converted into the HAL's
+    // samsung.android.scaler.zoomRatio. setZoomTranslate() is called when a session is configured.
+    static void setZoomTranslate(bool on);
+    static bool needsZoomTranslate(const camera_metadata_t* settings);
+    static bool translateZoom(common::helper::CameraMetadata* settings);
+
+    // Reads the native zoom ratio (relative to the main camera) of the camera that is being opened.
+    static void setNativeZoom(const camera_metadata_t* chars);
+
+    // Publishes the HAL's slow motion (constrained high speed) modes for cameras that only list
+    // them in the vendor table, together with the CONSTRAINED_HIGH_SPEED_VIDEO capability.
+    static void addHighSpeedConfigs(common::helper::CameraMetadata* chars);
+
     // Returns true if a change between two sets of session parameters needs a stream
     // reconfiguration: any change other than the AE target fps range, or a change of the
     // effective high fps range.

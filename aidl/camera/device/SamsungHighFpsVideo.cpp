@@ -12,6 +12,7 @@
 #include <system/graphics-base.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <cstring>
 #include <mutex>
@@ -53,6 +54,12 @@ struct SamsungTags {
     // recordingMinFps does not exist on every HAL (it is absent on the Exynos 990 one), so it is
     // only used when the HAL provides it.
     bool hasRecordingMinFps = false;
+    uint32_t availableHighSpeedVideoConfigurations = 0;
+    bool hasHighSpeedTable = false;
+    uint32_t minZoomList = 0;
+    bool hasMinZoomList = false;
+    uint32_t scalerZoomRatio = 0;
+    bool hasScalerZoomRatio = false;
 };
 
 std::once_flag sInitFlag;
@@ -131,6 +138,9 @@ void SamsungHighFpsVideo::init(const sp<common::helper::SamsungCameraModule>& mo
                           &t.recordingMaxFps);
         t.hasRecordingMinFps = findTag(ops, tags, "samsung.android.control", "recordingMinFps",
                                        &t.recordingMinFps);
+        t.hasHighSpeedTable = findTag(ops, tags, "samsung.android.scaler", "availableHighSpeedVideoConfigurations", &t.availableHighSpeedVideoConfigurations);
+        t.hasMinZoomList = findTag(ops, tags, "samsung.android.scaler", "availableMinDigitalZoomList", &t.minZoomList);
+        t.hasScalerZoomRatio = findTag(ops, tags, "samsung.android.scaler", "zoomRatio", &t.scalerZoomRatio);
         if (!t.valid) {
             ALOGW("%s: Samsung video vendor tags not found, high fps video disabled", __FUNCTION__);
             return;
@@ -325,27 +335,32 @@ void SamsungHighFpsVideo::addVideoSizes(CameraMetadata* chars) {
     std::vector<int64_t> newDur(dur.data.i64, dur.data.i64 + dur.count);
     std::vector<int64_t> newStall(stall.data.i64, stall.data.i64 + stall.count);
 
-    const int32_t format = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
     bool changed = false;
     for (const auto& [size, duration] : wanted) {
-        bool present = false;
-        for (size_t i = 0; i < newCfg.size(); i += 4) {
-            if (newCfg[i] == format && newCfg[i + 1] == size.first && newCfg[i + 2] == size.second &&
-                newCfg[i + 3] == ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT) {
-                present = true;
-                break;
+        // 8K only as encoder (IMPLEMENTATION_DEFINED) output; 4K also as YUV_420_888, like the main lens.
+        std::vector<int32_t> formats = {HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED};
+        if (size.first < 7680) {
+            formats.push_back(HAL_PIXEL_FORMAT_YCBCR_420_888);
+        }
+        for (int32_t format : formats) {
+            bool present = false;
+            for (size_t i = 0; i < newCfg.size(); i += 4) {
+                if (newCfg[i] == format && newCfg[i + 1] == size.first &&
+                    newCfg[i + 2] == size.second &&
+                    newCfg[i + 3] == ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT) {
+                    present = true;
+                    break;
+                }
             }
+            if (present) {
+                continue;
+            }
+            newCfg.insert(newCfg.end(), {format, size.first, size.second,
+                                         ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT});
+            newDur.insert(newDur.end(), {format, size.first, size.second, duration});
+            newStall.insert(newStall.end(), {format, size.first, size.second, 0});
+            changed = true;
         }
-        if (present) {
-            continue;
-        }
-        newCfg.insert(newCfg.end(), {format, size.first, size.second,
-                                     ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT});
-        newDur.insert(newDur.end(), {format, size.first, size.second, duration});
-        newStall.insert(newStall.end(), {format, size.first, size.second, 0});
-        changed = true;
-        ALOGI("%s: advertising video size %dx%d (min frame duration %lld ns)", __FUNCTION__,
-              size.first, size.second, (long long)duration);
     }
     if (!changed) {
         return;
@@ -353,6 +368,183 @@ void SamsungHighFpsVideo::addVideoSizes(CameraMetadata* chars) {
     chars->update(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, newCfg.data(), newCfg.size());
     chars->update(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, newDur.data(), newDur.size());
     chars->update(ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, newStall.data(), newStall.size());
+}
+
+namespace {
+std::atomic<int32_t> sClampFps{0};
+}  // namespace
+
+void SamsungHighFpsVideo::setClampFps(int32_t fps) {
+    int32_t old = sClampFps.exchange(fps);
+    if (old != fps) {
+    }
+}
+
+bool SamsungHighFpsVideo::needsFpsClamp(const camera_metadata_t* params) {
+    int32_t fps = sClampFps.load();
+    if (fps <= 0 || params == nullptr) {
+        return false;
+    }
+    camera_metadata_ro_entry entry;
+    if (find_camera_metadata_ro_entry(params, ANDROID_CONTROL_AE_TARGET_FPS_RANGE, &entry) != 0 ||
+        entry.count != 2) {
+        return false;
+    }
+    return entry.data.i32[1] > fps || entry.data.i32[0] > fps;
+}
+
+bool SamsungHighFpsVideo::clampFpsRange(CameraMetadata* params) {
+    int32_t fps = sClampFps.load();
+    if (fps <= 0 || params == nullptr || params->isEmpty()) {
+        return false;
+    }
+    const CameraMetadata& ro = *params;
+    camera_metadata_ro_entry entry = ro.find(ANDROID_CONTROL_AE_TARGET_FPS_RANGE);
+    if (entry.count != 2 || (entry.data.i32[1] <= fps && entry.data.i32[0] <= fps)) {
+        return false;
+    }
+    int32_t range[2] = {fps, fps};
+    params->update(ANDROID_CONTROL_AE_TARGET_FPS_RANGE, range, 2);
+    return true;
+}
+
+namespace {
+std::atomic<bool> sZoomTranslate{false};
+std::atomic<float> sNativeZoom{1.0f};
+std::mutex sZoomMutex;
+int32_t sBaseCrop[4] = {0, 0, 0, 0};  // the 1x crop region: the largest one seen in this session
+float sLoggedRatio = 0.0f;
+int32_t sActiveArray[4] = {0, 0, 0, 0};  // x, y, w, h of the opened camera
+}  // namespace
+
+void SamsungHighFpsVideo::setZoomTranslate(bool on) {
+    std::lock_guard<std::mutex> lock(sZoomMutex);
+    sZoomTranslate = on;
+    memset(sBaseCrop, 0, sizeof(sBaseCrop));
+    sLoggedRatio = 0.0f;
+}
+
+bool SamsungHighFpsVideo::needsZoomTranslate(const camera_metadata_t* settings) {
+    if (!sZoomTranslate.load() || !sTags.hasScalerZoomRatio || settings == nullptr) {
+        return false;
+    }
+    int32_t minFps, maxFps;
+    return getHighFpsRange(settings, &minFps, &maxFps);
+}
+
+bool SamsungHighFpsVideo::translateZoom(CameraMetadata* settings) {
+    if (settings == nullptr || settings->isEmpty()) {
+        return false;
+    }
+    const CameraMetadata& ro = *settings;
+    camera_metadata_ro_entry crop = ro.find(ANDROID_SCALER_CROP_REGION);
+    int32_t active[4];
+    {
+        std::lock_guard<std::mutex> lock(sZoomMutex);
+        memcpy(active, sActiveArray, sizeof(active));
+    }
+    if (crop.count != 4 || crop.data.i32[2] <= 0 || active[2] <= 0 || active[3] <= 0) {
+        return false;
+    }
+    int32_t cur[4] = {crop.data.i32[0], crop.data.i32[1], crop.data.i32[2], crop.data.i32[3]};
+    float ratio = (float)active[2] / (float)cur[2];
+    camera_metadata_ro_entry zr = ro.find(ANDROID_CONTROL_ZOOM_RATIO);
+    if (zr.count == 1 && zr.data.f[0] > ratio) {
+        ratio = zr.data.f[0];  // the app zooms with the zoom ratio and left the crop region alone
+    }
+    if (ratio < 1.0f) {
+        ratio = 1.0f;
+    }
+    float vendorRatio = ratio * sNativeZoom.load();
+    {
+        std::lock_guard<std::mutex> lock(sZoomMutex);
+        if (ratio > sLoggedRatio + 0.5f || ratio < sLoggedRatio - 0.5f) {
+            sLoggedRatio = ratio;
+        }
+    }
+    settings->update(sTags.scalerZoomRatio, &vendorRatio, 1);
+    // The crop region is left as the app set it: the HAL uses it when it ignores the vendor zoom ratio.
+    return true;
+}
+
+void SamsungHighFpsVideo::setNativeZoom(const camera_metadata_t* chars) {
+    float native = 1.0f;
+    if (chars != nullptr && sTags.hasMinZoomList) {
+        camera_metadata_ro_entry entry;
+        // Index 5: the zoom range of the camera's own (tele / ultrawide) video zoom mode.
+        if (find_camera_metadata_ro_entry(chars, sTags.minZoomList, &entry) == 0 &&
+            entry.type == TYPE_FLOAT && entry.count > 5 && entry.data.f[5] > 0.0f) {
+            native = entry.data.f[5];
+        }
+    }
+    sNativeZoom = native;
+    int32_t active[4] = {0, 0, 0, 0};
+    if (chars != nullptr) {
+        camera_metadata_ro_entry a;
+        if (find_camera_metadata_ro_entry(chars, ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE, &a) == 0 &&
+            a.count == 4) {
+            memcpy(active, a.data.i32, sizeof(active));
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(sZoomMutex);
+        memcpy(sActiveArray, active, sizeof(active));
+    }
+}
+
+void SamsungHighFpsVideo::addHighSpeedConfigs(CameraMetadata* chars) {
+    if (chars == nullptr || !sTags.valid || !sTags.hasHighSpeedTable) {
+        return;
+    }
+    const CameraMetadata& ro = *chars;
+    camera_metadata_ro_entry pub = ro.find(ANDROID_CONTROL_AVAILABLE_HIGH_SPEED_VIDEO_CONFIGURATIONS);
+    if (pub.count > 0) {
+        return;
+    }
+    // (width, height, minFps, maxFps, unused)
+    constexpr size_t kHsStride = 5;
+    camera_metadata_ro_entry hs = ro.find(sTags.availableHighSpeedVideoConfigurations);
+    if (hs.count == 0 || hs.count % kHsStride != 0) {
+        return;
+    }
+    std::vector<int32_t> out;
+    for (size_t i = 0; i < hs.count; i += kHsStride) {
+        const int32_t* c = &hs.data.i32[i];
+        if (c[0] <= 0 || c[1] <= 0 || c[2] != c[3] || c[3] < 120) {
+            continue;
+        }
+        // Same batch sizes as the main camera: 2 for 120 fps, 4 for 240 fps.
+        int32_t batch = c[3] / 60;
+        out.insert(out.end(), {c[0], c[1], 30, c[3], batch});
+        out.insert(out.end(), {c[0], c[1], c[3], c[3], batch});
+    }
+    if (out.empty()) {
+        return;
+    }
+    camera_metadata_ro_entry caps = ro.find(ANDROID_REQUEST_AVAILABLE_CAPABILITIES);
+    std::vector<uint8_t> newCaps;
+    if (caps.count > 0) {
+        newCaps.assign(caps.data.u8, caps.data.u8 + caps.count);
+    }
+    if (std::find(newCaps.begin(), newCaps.end(),
+                  (uint8_t)ANDROID_REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO) ==
+        newCaps.end()) {
+        newCaps.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO);
+    }
+    // Entries are invalidated by update(): the data above was copied first.
+    chars->update(ANDROID_CONTROL_AVAILABLE_HIGH_SPEED_VIDEO_CONFIGURATIONS, out.data(), out.size());
+    chars->update(ANDROID_REQUEST_AVAILABLE_CAPABILITIES, newCaps.data(), newCaps.size());
+
+    camera_metadata_ro_entry charKeys = ro.find(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS);
+    if (charKeys.count > 0) {
+        std::vector<int32_t> keys(charKeys.data.i32, charKeys.data.i32 + charKeys.count);
+        if (std::find(keys.begin(), keys.end(),
+                      (int32_t)ANDROID_CONTROL_AVAILABLE_HIGH_SPEED_VIDEO_CONFIGURATIONS) ==
+            keys.end()) {
+            keys.push_back(ANDROID_CONTROL_AVAILABLE_HIGH_SPEED_VIDEO_CONFIGURATIONS);
+            chars->update(ANDROID_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS, keys.data(), keys.size());
+        }
+    }
 }
 
 bool SamsungHighFpsVideo::isReconfigurationRequired(const camera_metadata_t* oldParams,
